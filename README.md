@@ -1,6 +1,12 @@
 # sh-bfa
 
-Backend-for-Agents: service registry (heartbeat TTL, round-robin over instances) + BM25 `/resolve` over the agent/tool catalog.
+Backend-for-Agents: a **stateless capability catalog + semantic resolver**. On
+startup (and on `POST /refresh`) it *pulls* each service's descriptor listed in
+`CATALOG_SOURCES` — an A2A agent card (`/.well-known/agent-card.json`) or the MCP
+`/tools` map — and indexes the skills/tools with BM25 (PT stemming + synonyms).
+`POST /resolve[/agents|/tools]` ranks them for a query and returns **logical
+service names + URLs**; the platform (k8s / compose) load-balances behind those.
+No self-registration, no per-instance registry — see `sh-infra/spec/13`.
 
 Part of the **Smart Home AI** system — architecture, the full `docker compose`
 stack and the end-to-end tests live in `sh-infra`.

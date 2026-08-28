@@ -1,12 +1,12 @@
-"""Lexical search over the registered catalog — Okapi BM25 (`rank_bm25`) with a
+"""Lexical search over the capability catalog — Okapi BM25 (`rank_bm25`) with a
 regex tokenizer that strips accents and PT/EN stopwords, reduces each token to a
 Portuguese stem (`snowballstemmer`), then expands a small synonym map so
 "acende a luz" and "liga a lampada" land on the same document. The BFA only
 ranks; the caller decides what to actually use.
 
-One document per agent (its skills folded together) and one per MCP tool. A
-service re-registering replaces all of its documents and the index is rebuilt
-(the corpus is a dozen entries — cheap)."""
+One document per catalog item (one per agent skill, one per MCP tool). A source
+re-pulled by `catalog.build` replaces all of its documents and the index is
+rebuilt (the corpus is a dozen entries — cheap)."""
 
 from __future__ import annotations
 
@@ -97,8 +97,9 @@ def normalize(text: str) -> list[str]:
 @dataclass
 class Document:
     kind: str  # "agent" | "tool"
-    service: str  # registry name
-    name: str  # tool name, skill id, or the service name for a bare agent
+    service: str  # logical service name (DNS), e.g. "security"
+    url: str  # base URL to call, e.g. "http://security:8200"
+    item: CatalogItem  # the skill / tool this document ranks for
     tokens: list[str] = field(default_factory=list)
 
 
@@ -109,22 +110,30 @@ class SearchIndex:
         self._docs: list[Document] = []
         self._bm25: BM25Okapi | None = None
 
-    def set_agent(self, service: str, capabilities: list[str], catalog: list[CatalogItem]) -> None:
-        tokens = list(capabilities) + [service]
-        for item in catalog:
-            tokens += [item.id, item.name, item.description] + list(item.tags) + list(item.examples)
-        self._replace(("agent", service), [Document("agent", service, service, _join_tokens(tokens))])
-
-    def set_tools(self, service: str, catalog: list[CatalogItem]) -> None:
+    def set_source(self, kind: str, service: str, url: str, items: list[CatalogItem]) -> None:
+        """Replace everything indexed for (kind, service) with one document per
+        catalog item. An agent that announced no skills still gets one bare
+        document keyed by its service name so it can be discovered at all."""
+        entries = list(items) or [CatalogItem(id=service, name=service)]
         docs = []
-        for item in catalog:
-            name = item.name or item.id
-            tokens = [name, item.description] + list(item.tags) + list(item.examples)
-            docs.append(Document("tool", service, item.id or name, _join_tokens(tokens)))
-        self._replace(("tool", service), docs)
+        for item in entries:
+            fragments = [item.id, item.name, item.description, service] + list(item.tags) + list(item.examples)
+            docs.append(Document(kind, service, url, item, _join_tokens(fragments)))
+        self._replace((kind, service), docs)
 
-    def remove_service(self, kind: str, service: str) -> None:
-        self._replace((kind, service), [])
+    def retain(self, keys: set[tuple[str, str]]) -> None:
+        """Drop any (kind, service) not in `keys` — stale after a refresh."""
+        with self._lock:
+            for key in list(self._by_service):
+                if key not in keys:
+                    del self._by_service[key]
+            self._rebuild()
+
+    def size(self) -> int:
+        return len(self._docs)
+
+    def documents(self) -> list[Document]:
+        return list(self._docs)
 
     def _replace(self, key: tuple[str, str], docs: list[Document]) -> None:
         with self._lock:

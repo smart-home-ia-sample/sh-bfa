@@ -33,8 +33,12 @@ def _items(rows):
 
 def _index():
     index = SearchIndex()
-    index.set_tools("home-mcp", _items(TOOLS))
+    index.set_source("tool", "home-mcp", "http://home-mcp:8100", _items(TOOLS))
     return index
+
+
+def _top_id(hits):
+    return hits[0][0].item.id
 
 
 def test_normalize_strips_accents_lowercases_and_drops_stopwords():
@@ -44,7 +48,6 @@ def test_normalize_strips_accents_lowercases_and_drops_stopwords():
 
 
 def test_normalize_stems_inflections_to_a_shared_root():
-    # "trancá" / "tranquei" / "trancar" are the same verb to the ranker
     assert set(normalize("Trancá a porta")) & set(normalize("já tranquei a porta"))
     assert set(normalize("acende a luz")) & set(normalize("acender a luz"))
 
@@ -56,13 +59,8 @@ def test_normalize_expands_synonyms_across_a_group():
 
 
 def test_synonym_query_reaches_a_tool_phrased_differently():
-    # the catalog says "liga a luz da cozinha"; the user says "acende"
-    hits = _index().query("acende a luz da cozinha", {"tool"}, threshold=0.3)
-    assert hits[0][0].name == "turn_light_on"
-
-    # catalog says "desliga o ar condicionado"; user says "apaga o ar"
-    hits = _index().query("apaga o ar condicionado do quarto", {"tool"}, threshold=0.3)
-    assert hits[0][0].name == "turn_ac_off"
+    assert _top_id(_index().query("acende a luz da cozinha", {"tool"}, 0.3)) == "turn_light_on"
+    assert _top_id(_index().query("apaga o ar condicionado do quarto", {"tool"}, 0.3)) == "turn_ac_off"
 
 
 def test_empty_index_returns_nothing():
@@ -72,28 +70,46 @@ def test_empty_index_returns_nothing():
 def test_index_finds_the_right_tool_by_a_paraphrased_query():
     hits = _index().query("pode trancar a porta?", {"tool"}, threshold=0.3)
     assert hits
-    assert hits[0][0].name == "lock_door"
+    assert _top_id(hits) == "lock_door"
 
 
 def test_a_paraphrased_temperature_query_hits_set_temperature():
     hits = _index().query("está muito quente, abaixa a temperatura", {"tool"}, threshold=0.3)
-    assert hits[0][0].name == "set_temperature"
+    assert _top_id(hits) == "set_temperature"
+
+
+def test_a_document_carries_its_source_service_and_url():
+    doc, _ = _index().query("tranca a porta", {"tool"}, 0.3)[0]
+    assert doc.service == "home-mcp"
+    assert doc.url == "http://home-mcp:8100"
 
 
 def test_index_kind_filter_separates_agents_and_tools():
     index = _index()
-    index.set_agent("security", ["lock_door"], _items([("lock_door", "Lock door", "Locks a door", [])]))
+    index.set_source("agent", "security", "http://security:8200",
+                     _items([("lock_door", "Lock door", "Locks a door", [])]))
 
     assert all(d.kind == "agent" for d, _ in index.query("lock door", {"agent"}, 0.0))
     assert all(d.kind == "tool" for d, _ in index.query("lock door", {"tool"}, 0.0))
 
 
-def test_removing_a_service_drops_its_documents():
+def test_retain_drops_a_source_that_left_the_list():
     index = _index()
-    assert index.query("trancar a porta", {"tool"}, 0.3)
+    index.set_source("agent", "security", "http://security:8200",
+                     _items([("arm_alarm", "Arm", "Arms the alarm", [])]))
+    assert index.query("arma o alarme", {"agent"}, 0.3)
 
-    index.remove_service("tool", "home-mcp")
-    assert index.query("trancar a porta", {"tool"}, 0.3) == []
+    index.retain({("tool", "home-mcp")})  # security no longer a source
+    assert index.query("arma o alarme", {"agent"}, 0.3) == []
+    assert index.query("tranca a porta", {"tool"}, 0.3)  # home-mcp kept
+
+
+def test_an_agent_with_no_skills_still_gets_one_bare_document():
+    index = SearchIndex()
+    index.set_source("agent", "energy", "http://energy:8400", [])
+    assert index.size() == 1
+    doc = index.documents()[0]
+    assert doc.item.id == "energy"
 
 
 def test_chitchat_query_clears_no_document():
@@ -103,5 +119,5 @@ def test_chitchat_query_clears_no_document():
 def test_top_score_is_normalized_coverage_between_0_and_1():
     hits = _index().query("apaga a luz da cozinha", {"tool"}, 0.3)
     assert hits
-    assert hits[0][0].name == "turn_light_off"
+    assert _top_id(hits) == "turn_light_off"
     assert 0.0 < hits[0][1] <= 1.0
