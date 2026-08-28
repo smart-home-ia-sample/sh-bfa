@@ -1,6 +1,8 @@
 """Lexical search over the registered catalog — Okapi BM25 (`rank_bm25`) with a
-regex tokenizer that strips accents and PT/EN stopwords. The BFA only ranks; the
-caller decides what to actually use.
+regex tokenizer that strips accents and PT/EN stopwords, reduces each token to a
+Portuguese stem (`snowballstemmer`), then expands a small synonym map so
+"acende a luz" and "liga a lampada" land on the same document. The BFA only
+ranks; the caller decides what to actually use.
 
 One document per agent (its skills folded together) and one per MCP tool. A
 service re-registering replaces all of its documents and the index is rebuilt
@@ -13,11 +15,14 @@ import threading
 import unicodedata
 from dataclasses import dataclass, field
 
+import snowballstemmer
 from rank_bm25 import BM25Okapi
 
 from app.models import CatalogItem
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+_STEMMER = snowballstemmer.stemmer("portuguese")
 
 # Common PT/EN fillers carry no retrieval signal and let a "polite" chit-chat
 # query ("olá, tudo bem?") incidentally match example phrases. Dropped from both
@@ -32,12 +37,61 @@ _STOPWORDS = frozenset(
 )
 
 
+# Verb/noun groups the ranker should treat as interchangeable. Authored as PT
+# surface forms and reduced to stems at import, so the table matches whatever the
+# stemmer emits for a live query (some verbs — "abrir/abre/abra" — are irregular
+# and never share a stem, hence every inflection is spelled out). Every member of
+# a group expands to the whole group at both index and query time.
+_SYNONYM_GROUPS = (
+    ("ligar", "liga", "ligue", "acender", "acende", "acenda", "ativar"),
+    ("desligar", "desliga", "apagar", "apaga", "apague", "escurecer", "escurece", "desativar"),
+    ("aumentar", "aumenta", "subir", "elevar"),
+    ("diminuir", "diminui", "abaixar", "abaixa", "baixar", "reduzir", "reduz"),
+    ("trancar", "tranca", "tranque", "fechar", "fecha", "feche"),
+    ("destrancar", "destranca", "destravar", "abrir", "abre", "abra"),
+    ("quente", "calor"),
+    ("frio", "gelado"),
+    ("geladeira", "refrigerador"),
+    ("televisao", "televisor", "tv"),
+    ("cafeteira", "cafe"),
+    ("cortina", "persiana"),
+    ("luz", "lampada", "iluminacao"),
+    ("alarme", "seguranca"),
+)
+
+
+def _stem(token: str) -> str:
+    return _STEMMER.stemWord(token)
+
+
+def _build_synonyms(groups: tuple[tuple[str, ...], ...]) -> dict[str, tuple[str, ...]]:
+    table: dict[str, tuple[str, ...]] = {}
+    for group in groups:
+        stems = tuple(dict.fromkeys(_stem(w) for w in group))
+        for stem in stems:
+            table[stem] = stems
+    return table
+
+
+_SYNONYMS = _build_synonyms(_SYNONYM_GROUPS)
+
+
 def normalize(text: str) -> list[str]:
-    """Lowercase, strip accents (PT examples), split on non-alphanumerics,
-    drop stopwords."""
+    """Lowercase, strip accents (PT examples), split on non-alphanumerics, drop
+    stopwords, stem each token (PT), then expand synonym groups. Duplicates are
+    collapsed keeping first-seen order."""
     decomposed = unicodedata.normalize("NFKD", text or "")
     stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
-    return [t for t in _TOKEN_RE.findall(stripped.lower()) if t not in _STOPWORDS]
+    raw = (t for t in _TOKEN_RE.findall(stripped.lower()) if t not in _STOPWORDS)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw:
+        stem = _stem(token)
+        for term in (stem, *_SYNONYMS.get(stem, ())):
+            if term not in seen:
+                seen.add(term)
+                out.append(term)
+    return out
 
 
 @dataclass

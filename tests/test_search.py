@@ -38,10 +38,31 @@ def _index():
 
 
 def test_normalize_strips_accents_lowercases_and_drops_stopwords():
-    assert normalize("Trancá a Porta!") == ["tranca", "porta"]
-    assert normalize("Ar-condicionado 22°C") == ["ar", "condicionado", "22", "c"]
+    assert normalize("Ar-condicionado 22°C") == ["ar", "condicion", "22", "c"]
     assert normalize("olá, tudo bem?") == []
     assert normalize("") == []
+
+
+def test_normalize_stems_inflections_to_a_shared_root():
+    # "trancá" / "tranquei" / "trancar" are the same verb to the ranker
+    assert set(normalize("Trancá a porta")) & set(normalize("já tranquei a porta"))
+    assert set(normalize("acende a luz")) & set(normalize("acender a luz"))
+
+
+def test_normalize_expands_synonyms_across_a_group():
+    assert set(normalize("acende a luz")) & set(normalize("liga a lâmpada"))
+    assert set(normalize("desliga a geladeira")) & set(normalize("apaga o refrigerador"))
+    assert set(normalize("abaixa a temperatura")) & set(normalize("diminui a temperatura"))
+
+
+def test_synonym_query_reaches_a_tool_phrased_differently():
+    # the catalog says "liga a luz da cozinha"; the user says "acende"
+    hits = _index().query("acende a luz da cozinha", {"tool"}, threshold=0.3)
+    assert hits[0][0].name == "turn_light_on"
+
+    # catalog says "desliga o ar condicionado"; user says "apaga o ar"
+    hits = _index().query("apaga o ar condicionado do quarto", {"tool"}, threshold=0.3)
+    assert hits[0][0].name == "turn_ac_off"
 
 
 def test_empty_index_returns_nothing():

@@ -1,3 +1,4 @@
 fastapi
 uvicorn[standard]
 rank-bm25==0.2.2
+snowballstemmer==2.2.0
