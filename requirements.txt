@@ -1,0 +1,3 @@
+fastapi
+uvicorn[standard]
+rank-bm25==0.2.2
