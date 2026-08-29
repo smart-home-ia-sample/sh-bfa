@@ -1,109 +1,31 @@
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter
 
-from app.client_host import resolve_client_host
-from app.models import ErrorResponse, ResolveRequest, ResolveResult, ServiceRegistration
-from app.registry import ServiceRegistry
+from app import catalog
+from app.models import ResolveRequest, ResolveResult
 from app.search import SearchIndex
 
-agent_registry = ServiceRegistry()
-mcp_registry = ServiceRegistry()
+# The catalog is derived state: pulled from CATALOG_SOURCES on startup and on
+# POST /refresh. No registration, no per-instance registry.
 search_index = SearchIndex()
 
 router = APIRouter()
 
 
-def _not_found(request: Request, name: str) -> JSONResponse:
-    correlation_id = getattr(request.state, "correlation_id", None)
-    return JSONResponse(
-        status_code=404,
-        content=ErrorResponse(error=f"service '{name}' is not registered", correlation_id=correlation_id).model_dump(),
-    )
-
-
-def _no_match(request: Request, capability: str) -> JSONResponse:
-    correlation_id = getattr(request.state, "correlation_id", None)
-    return JSONResponse(
-        status_code=503,
-        content=ErrorResponse(
-            error=f"no healthy agent available for capability '{capability}'", correlation_id=correlation_id
-        ).model_dump(),
-    )
-
-
-# ---- registration ------------------------------------------------------------
-
-
-@router.post("/agents/register")
-def register_agent(registration: ServiceRegistration, request: Request):
-    record = agent_registry.register(registration, resolve_client_host(request))
-    search_index.set_agent(registration.name, registration.capabilities, registration.catalog)
-    return record
-
-
-@router.post("/mcp/register")
-def register_mcp(registration: ServiceRegistration, request: Request):
-    record = mcp_registry.register(registration, resolve_client_host(request))
-    search_index.set_tools(registration.name, registration.catalog)
-    return record
-
-
-# ---- discovery -------------------------------------------------------------
-
-
-@router.get("/agents")
-def list_agents(request: Request, capability: str | None = None):
-    if capability is None:
-        return agent_registry.list()
-
-    match = agent_registry.find_by_capability(capability)
-    if match is None:
-        return _no_match(request, capability)
-    return [match]
-
-
-@router.get("/agents/{name}")
-def get_agent(name: str, request: Request):
-    view = agent_registry.get_view(name)
-    if view is None:
-        return _not_found(request, name)
-    return view
-
-
-@router.get("/mcp")
-def list_mcp():
-    return mcp_registry.list()
-
-
-@router.get("/mcp/{name}")
-def get_mcp(name: str, request: Request):
-    view = mcp_registry.get_view(name)
-    if view is None:
-        return _not_found(request, name)
-    return view
-
-
-# ---- resolve (BM25 ranking; the BFA ranks, the caller decides) ------------
-
-
 def _resolve(body: ResolveRequest, kinds: set[str]) -> list[ResolveResult]:
     hits = search_index.query(body.query, kinds, body.threshold)
-
     results: list[ResolveResult] = []
     for doc, coverage in hits:
-        registry = agent_registry if doc.kind == "agent" else mcp_registry
-        record = registry.resolve(doc.service)
-        if record is None:  # no healthy instance right now
-            continue
         results.append(
             ResolveResult(
-                type=doc.kind,
+                kind=doc.kind,
                 service=doc.service,
-                name=doc.name,
-                endpoint=record.endpoint,
-                protocol=record.protocol,
+                url=doc.url,
+                id=doc.item.id or doc.service,
+                name=doc.item.name,
+                description=doc.item.description,
+                tags=list(doc.item.tags),
+                examples=list(doc.item.examples),
                 score=round(coverage, 3),
-                rank=len(results) + 1,
             )
         )
         if len(results) >= max(0, body.top_k):
@@ -111,22 +33,35 @@ def _resolve(body: ResolveRequest, kinds: set[str]) -> list[ResolveResult]:
     return results
 
 
-@router.post("/resolve")
+@router.post("/resolve", response_model=list[ResolveResult])
 def resolve(body: ResolveRequest):
     return _resolve(body, {"agent", "tool"})
 
 
-@router.post("/resolve/agents")
+@router.post("/resolve/agents", response_model=list[ResolveResult])
 def resolve_agents(body: ResolveRequest):
     return _resolve(body, {"agent"})
 
 
-@router.post("/resolve/tools")
+@router.post("/resolve/tools", response_model=list[ResolveResult])
 def resolve_tools(body: ResolveRequest):
     return _resolve(body, {"tool"})
 
 
-# ---- health --------------------------------------------------------------------
+@router.post("/refresh")
+def refresh():
+    """Re-pull every source and rebuild the catalog. Call on a deploy that
+    changed a service's capabilities."""
+    return catalog.build(search_index)
+
+
+@router.get("/catalog")
+def list_catalog():
+    """What is currently indexed — for debugging."""
+    return [
+        {"kind": d.kind, "service": d.service, "url": d.url, "id": d.item.id, "tags": list(d.item.tags)}
+        for d in search_index.documents()
+    ]
 
 
 @router.get("/health")
